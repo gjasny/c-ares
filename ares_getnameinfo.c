@@ -323,17 +323,27 @@ static char *lookup_service(unsigned short port, int flags,
 #endif
         }
       if (sep && sep->s_name)
-        /* get service name */
-        strcpy(tmpbuf, sep->s_name);
+        {
+          /* get service name */
+          size_t name_len = strlen(sep->s_name);
+          if (name_len < buflen)
+            /* return it if buffer big enough */
+            memcpy(buf, sep->s_name, name_len + 1);
+          else
+            /* avoid reusing previous one */
+            buf[0] = '\0';
+        }
       else
-        /* get port as a string */
-        sprintf(tmpbuf, "%u", (unsigned int)ntohs(port));
-      if (strlen(tmpbuf) < buflen)
-        /* return it if buffer big enough */
-        strcpy(buf, tmpbuf);
-      else
-        /* avoid reusing previous one */
-        buf[0] = '\0';
+        {
+          /* get port as a string */
+          sprintf(tmpbuf, "%u", (unsigned int)ntohs(port));
+          if (strlen(tmpbuf) < buflen)
+            /* return it if buffer big enough */
+            strcpy(buf, tmpbuf);
+          else
+            /* avoid reusing previous one */
+            buf[0] = '\0';
+        }
       return buf;
     }
   buf[0] = '\0';
