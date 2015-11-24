@@ -346,7 +346,15 @@ if test "$HAVE_GETHOSTBYNAME" != "1"; then
   AC_MSG_ERROR([couldn't find libraries for gethostbyname()])
 fi
 
+dnl resolv lib
+
+if test "$host_vendor" = "apple"
+then
+    AC_CHECK_LIB(resolv, res_servicename)
+fi
+
 dnl resolve lib?
+
 AC_CHECK_FUNC(strcasecmp, , [ AC_CHECK_LIB(resolve, strcasecmp) ])
 
 if test "$ac_cv_lib_resolve_strcasecmp" = "$ac_cv_func_strcasecmp"; then

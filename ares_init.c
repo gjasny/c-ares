@@ -49,6 +49,10 @@
 #define MAX_DNS_PROPERTIES    8
 #endif
 
+#if defined(__APPLE__)
+#include <resolv.h>
+#endif
+
 #include "ares.h"
 #include "ares_inet_net_pton.h"
 #include "ares_library_init.h"
@@ -1058,7 +1062,7 @@ static int get_DNS_Windows(char **outptr)
 
 static int init_by_resolv_conf(ares_channel channel)
 {
-#if !defined(ANDROID) && !defined(__ANDROID__) && !defined(WATT32)
+#if !defined(ANDROID) && !defined(__ANDROID__) && !defined(__APPLE__) && !defined(WATT32)
   char *line = NULL;
 #endif
   int status = -1, nservers = 0, nsort = 0;
@@ -1149,6 +1153,63 @@ static int init_by_resolv_conf(ares_channel channel)
     if (status != ARES_SUCCESS)
       break;
     status = ARES_EOF;
+  }
+#elif defined(__APPLE__)
+  struct __res_state res;
+  memset(&res, 0, sizeof(res));
+  int result = res_ninit(&res);
+  DEBUGF(fprintf(stderr, "res_ninit result = %d res.nscount = %d\n",
+                 result, res.nscount));
+  if (result == 0 && (res.options & RES_INIT)) {
+
+    if (channel->nservers == -1) {
+      union res_sockaddr_union addr[MAXNS];
+      int nscount = res_getservers(&res, addr, MAXNS);
+      status = ARES_EOF;
+      for (int i = 0; i < nscount; ++i) {
+        char str[INET6_ADDRSTRLEN];
+        sa_family_t family = addr[i].sin.sin_family;
+        if (family == AF_INET) {
+          ares_inet_ntop(family, &addr[i].sin.sin_addr, str, sizeof(str));
+        } else if (family == AF_INET6) {
+          ares_inet_ntop(family, &addr[i].sin6.sin6_addr, str, sizeof(str));
+        } else {
+          continue;
+        }
+
+        status = config_nameserver(&servers, &nservers, str);
+        DEBUGF(fprintf(stderr, "config_nameserver[%d] %s, status = %d\n",
+                       i, str, status));
+
+        if (status != ARES_SUCCESS)
+          break;
+      }
+    }
+    if (channel->ndomains == -1) {
+      int entries = 0;
+      while ((entries < MAXDNSRCH) && res.dnsrch[entries])
+        entries++;
+
+      channel->domains = malloc(entries * sizeof(char *));
+      if (!channel->domains) {
+        status = ARES_ENOMEM;
+      } else {
+        channel->ndomains = entries;
+        for (int i = 0; i < channel->ndomains; ++i) {
+          channel->domains[i] = strdup(res.dnsrch[i]);
+        }
+      }
+    }
+    if (channel->ndots == -1)
+      channel->ndots = res.ndots;
+    if (channel->tries == -1)
+      channel->tries = res.retry;
+    if (channel->rotate == -1)
+      channel->rotate = res.options & RES_ROTATE;
+    if (channel->timeout == -1)
+      channel->timeout = res.retrans * 1000;
+
+    res_ndestroy(&res);
   }
 #else
   {
