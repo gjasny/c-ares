@@ -81,7 +81,7 @@ static const char *try_option(const char *p, const char *q, const char *opt);
 static int init_id_key(rc4_key* key,int key_data_len);
 
 #if !defined(WIN32) && !defined(WATT32) && \
-    !defined(ANDROID) && !defined(__ANDROID__)
+    !defined(ANDROID) && !defined(__ANDROID__) && !defined(__APPLE__)
 static int sortlist_alloc(struct apattern **sortlist, int *nsort,
                           struct apattern *pat);
 static int ip_addr(const char *s, ssize_t len, struct in_addr *addr);
@@ -1161,13 +1161,14 @@ static int init_by_resolv_conf(ares_channel channel)
   DEBUGF(fprintf(stderr, "res_ninit result = %d res.nscount = %d\n",
                  result, res.nscount));
   if (result == 0 && (res.options & RES_INIT)) {
+    status = ARES_EOF;
 
     if (channel->nservers == -1) {
       union res_sockaddr_union addr[MAXNS];
       int nscount = res_getservers(&res, addr, MAXNS);
-      status = ARES_EOF;
       for (int i = 0; i < nscount; ++i) {
         char str[INET6_ADDRSTRLEN];
+        int config_status;
         sa_family_t family = addr[i].sin.sin_family;
         if (family == AF_INET) {
           ares_inet_ntop(family, &addr[i].sin.sin_addr, str, sizeof(str));
@@ -1177,12 +1178,14 @@ static int init_by_resolv_conf(ares_channel channel)
           continue;
         }
 
-        status = config_nameserver(&servers, &nservers, str);
+        config_status = config_nameserver(&servers, &nservers, str);
         DEBUGF(fprintf(stderr, "config_nameserver[%d] %s, status = %d\n",
-                       i, str, status));
+                       i, str, config_status));
 
-        if (status != ARES_SUCCESS)
+        if (config_status != ARES_SUCCESS) {
+          status = config_status;
           break;
+        }
       }
     }
     if (channel->ndomains == -1) {
@@ -1531,7 +1534,7 @@ static int init_by_defaults(ares_channel channel)
 }
 
 #if !defined(WIN32) && !defined(WATT32) && \
-    !defined(ANDROID) && !defined(__ANDROID__)
+    !defined(ANDROID) && !defined(__ANDROID__) && !defined(__APPLE__)
 static int config_domain(ares_channel channel, char *str)
 {
   char *q;
@@ -1644,7 +1647,7 @@ static int config_nameserver(struct server_state **servers, int *nservers,
   return ARES_SUCCESS;
 }
 
-#if !defined(WIN32) && !defined(ANDROID) && !defined(__ANDROID__)
+#if !defined(WIN32) && !defined(ANDROID) && !defined(__ANDROID__) && !defined(__APPLE__)
 static int config_sortlist(struct apattern **sortlist, int *nsort,
                            const char *str)
 {
@@ -1825,7 +1828,7 @@ static const char *try_option(const char *p, const char *q, const char *opt)
 }
 
 #if !defined(WIN32) && !defined(WATT32) && \
-    !defined(ANDROID) && !defined(__ANDROID__)
+    !defined(ANDROID) && !defined(__ANDROID__) && !defined(__APPLE__)
 static char *try_config(char *s, const char *opt, char scc)
 {
   size_t len;
