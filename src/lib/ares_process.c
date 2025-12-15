@@ -64,8 +64,7 @@ static ares_bool_t same_questions(const ares_query_t      *query,
                                   const ares_dns_record_t *arec);
 static void        end_query(ares_channel_t *channel, ares_server_t *server,
                              ares_query_t *query, ares_status_t status,
-                             ares_dns_record_t *dnsrec,
-                             ares_array_t **requeue);
+                             const ares_dns_record_t *dnsrec);
 
 static void        ares_query_remove_from_conn(ares_query_t *query)
 {
@@ -512,27 +511,16 @@ static ares_status_t read_conn_packets(ares_conn_t *conn)
   return ARES_SUCCESS;
 }
 
-typedef enum {
-  REQUEUE_REQUEUE  = 1,
-  REQUEUE_ENDQUERY = 2
-} requeue_type_t;
-
 /* Simple data structure to store a query that needs to be requeued with
  * optional server */
 typedef struct {
-  requeue_type_t     type;   /* type of entry, requeue or endquery */
-  unsigned short     qid;    /* query id */
-  ares_server_t     *server; /* requeue only: optional */
-  ares_status_t      status; /* endquery only */
-  ares_dns_record_t *dnsrec; /* endquery only: optional */
+  unsigned short qid;
+  ares_server_t *server; /* optional */
 } ares_requeue_t;
 
-static ares_status_t ares_append_requeue_int(ares_array_t     **requeue,
-                                             requeue_type_t     type,
-                                             ares_query_t      *query,
-                                             ares_server_t     *server,
-                                             ares_status_t      status,
-                                             ares_dns_record_t *dnsrec)
+static ares_status_t ares_append_requeue(ares_array_t **requeue,
+                                         ares_query_t *query,
+                                         ares_server_t *server)
 {
   ares_requeue_t entry;
 
@@ -545,36 +533,16 @@ static ares_status_t ares_append_requeue_int(ares_array_t     **requeue,
 
   ares_query_remove_from_conn(query);
 
-  entry.type   = type;
   entry.qid    = query->qid;
   entry.server = server;
-  entry.status = status;
-  entry.dnsrec = dnsrec;
   return ares_array_insertdata_last(*requeue, &entry);
-}
-
-static ares_status_t ares_append_requeue(ares_array_t **requeue,
-                                         ares_query_t  *query,
-                                         ares_server_t *server)
-{
-  return ares_append_requeue_int(requeue, REQUEUE_REQUEUE, query, server, 0,
-    NULL);
-}
-
-static ares_status_t ares_append_endqueue(ares_array_t     **requeue,
-                                          ares_query_t      *query,
-                                          ares_status_t      status,
-                                          ares_dns_record_t *dnsrec)
-{
-  return ares_append_requeue_int(requeue, REQUEUE_ENDQUERY, query, NULL, status,
-    dnsrec);
 }
 
 static ares_status_t read_answers(ares_conn_t *conn, const ares_timeval_t *now)
 {
   ares_status_t   status;
-  ares_channel_t *channel  = conn->server->channel;
-  ares_array_t   *requeue  = NULL;
+  ares_channel_t *channel = conn->server->channel;
+  ares_array_t   *requeue = NULL;
 
   /* Process all queued answers */
   while (1) {
@@ -634,29 +602,17 @@ cleanup:
       break;
     }
 
+    /* Query disappeared */
     query = ares_htable_szvp_get_direct(channel->queries_by_qid, entry.qid);
-
-    if (entry.type == REQUEUE_REQUEUE) {
-      /* query disappeared */
-      if (query == NULL) {
-        continue;
-      }
-      internal_status = ares_send_query(entry.server, query, now);
-      /* We only care about ARES_ENOMEM */
-      if (internal_status == ARES_ENOMEM) {
-        status = ARES_ENOMEM;
-      }
-    } else { /* REQUEUE_ENDQUERY */
-      if (query != NULL) {
-        query->callback(query->arg, entry.status, query->timeouts, entry.dnsrec);
-        ares_free_query(query);
-      }
-      ares_dns_record_destroy(entry.dnsrec);
+    if (query == NULL) {
+      continue;
     }
-  }
-  /* Don't forget to send notification if queue emptied */
-  if (requeue != NULL) {
-    ares_queue_notify_empty(channel);
+
+    internal_status = ares_send_query(entry.server, query, now);
+    /* We only care about ARES_ENOMEM */
+    if (internal_status == ARES_ENOMEM) {
+      status = ARES_ENOMEM;
+    }
   }
   ares_array_destroy(requeue);
 
@@ -713,7 +669,7 @@ static ares_status_t process_timeouts(ares_channel_t       *channel,
     conn = query->conn;
     server_increment_failures(conn->server, query->using_tcp);
     status = ares_requeue_query(query, now, ARES_ETIMEOUT, ARES_TRUE, NULL,
-      NULL);
+                                NULL);
     if (status == ARES_ENOMEM) {
       goto done;
     }
@@ -868,7 +824,7 @@ static ares_status_t process_answer(ares_channel_t      *channel,
   if (issue_might_be_edns(query->query, rdnsrec)) {
     status = rewrite_without_edns(query);
     if (status != ARES_SUCCESS) {
-      end_query(channel, server, query, status, NULL, NULL);
+      end_query(channel, server, query, status, NULL);
       goto cleanup;
     }
 
@@ -913,9 +869,7 @@ static ares_status_t process_answer(ares_channel_t      *channel,
       }
 
       server_increment_failures(server, query->using_tcp);
-      status = ares_requeue_query(query, now, status, ARES_TRUE, rdnsrec,
-        requeue);
-      rdnsrec = NULL; /* Free'd by ares_requeue_query() */
+      status = ares_requeue_query(query, now, status, ARES_TRUE, rdnsrec, requeue);
 
       if (status != ARES_ENOMEM) {
         /* Should any of these cause a connection termination?
@@ -928,11 +882,12 @@ static ares_status_t process_answer(ares_channel_t      *channel,
 
   /* If cache insertion was successful, it took ownership.  We ignore
    * other cache insertion failures. */
-  ares_qcache_insert(channel, now, query, rdnsrec);
+  if (ares_qcache_insert(channel, now, query, rdnsrec) == ARES_SUCCESS) {
+    is_cached = ARES_TRUE;
+  }
 
   server_set_good(server, query->using_tcp);
-  end_query(channel, server, query, ARES_SUCCESS, rdnsrec, requeue);
-  rdnsrec = NULL; /* Free'd by the requeue */
+  end_query(channel, server, query, ARES_SUCCESS, rdnsrec);
 
   status = ARES_SUCCESS;
 
@@ -967,7 +922,7 @@ static void handle_conn_error(ares_conn_t *conn, ares_bool_t critical_failure,
 ares_status_t ares_requeue_query(ares_query_t *query, const ares_timeval_t *now,
                                  ares_status_t            status,
                                  ares_bool_t              inc_try_count,
-                                 ares_dns_record_t       *dnsrec,
+                                 const ares_dns_record_t *dnsrec,
                                  ares_array_t           **requeue)
 {
   ares_channel_t *channel   = query->channel;
@@ -984,7 +939,6 @@ ares_status_t ares_requeue_query(ares_query_t *query, const ares_timeval_t *now,
   }
 
   if (query->try_count < max_tries && !query->no_retries) {
-    ares_dns_record_destroy(dnsrec);
     if (requeue != NULL) {
       return ares_append_requeue(requeue, query, NULL);
     }
@@ -996,7 +950,7 @@ ares_status_t ares_requeue_query(ares_query_t *query, const ares_timeval_t *now,
     query->error_status = ARES_ETIMEOUT;
   }
 
-  end_query(channel, NULL, query, query->error_status, dnsrec, requeue);
+  end_query(channel, NULL, query, query->error_status, dnsrec);
   return ARES_ETIMEOUT;
 }
 
@@ -1278,7 +1232,7 @@ ares_status_t ares_send_query(ares_server_t *requested_server,
   }
 
   if (server == NULL) {
-    end_query(channel, server, query, ARES_ENOSERVER /* ? */, NULL, NULL);
+    end_query(channel, server, query, ARES_ENOSERVER /* ? */, NULL);
     return ARES_ENOSERVER;
   }
 
@@ -1306,7 +1260,7 @@ ares_status_t ares_send_query(ares_server_t *requested_server,
 
       /* Anything else is not retryable, likely ENOMEM */
       default:
-        end_query(channel, server, query, status, NULL, NULL);
+        end_query(channel, server, query, status, NULL);
         return status;
     }
   }
@@ -1320,7 +1274,7 @@ ares_status_t ares_send_query(ares_server_t *requested_server,
 
     case ARES_ENOMEM:
       /* Not retryable */
-      end_query(channel, server, query, status, NULL, NULL);
+      end_query(channel, server, query, status, NULL);
       return status;
 
     /* These conditions are retryable as they are server-specific
@@ -1352,7 +1306,7 @@ ares_status_t ares_send_query(ares_server_t *requested_server,
     ares_slist_insert(channel->queries_by_timeout, query);
   if (!query->node_queries_by_timeout) {
     /* LCOV_EXCL_START: OutOfMemory */
-    end_query(channel, server, query, ARES_ENOMEM, NULL, NULL);
+    end_query(channel, server, query, ARES_ENOMEM, NULL);
     return ARES_ENOMEM;
     /* LCOV_EXCL_STOP */
   }
@@ -1365,7 +1319,7 @@ ares_status_t ares_send_query(ares_server_t *requested_server,
 
   if (query->node_queries_to_conn == NULL) {
     /* LCOV_EXCL_START: OutOfMemory */
-    end_query(channel, server, query, ARES_ENOMEM, NULL, NULL);
+    end_query(channel, server, query, ARES_ENOMEM, NULL);
     return ARES_ENOMEM;
     /* LCOV_EXCL_STOP */
   }
@@ -1453,7 +1407,7 @@ static void ares_detach_query(ares_query_t *query)
 
 static void end_query(ares_channel_t *channel, ares_server_t *server,
                       ares_query_t *query, ares_status_t status,
-                      ares_dns_record_t *dnsrec, ares_array_t **requeue)
+                      const ares_dns_record_t *dnsrec)
 {
   /* If we were probing for the server to come back online, lets mark it as
    * no longer being probed */
@@ -1462,12 +1416,6 @@ static void end_query(ares_channel_t *channel, ares_server_t *server,
   }
 
   ares_metrics_record(query, server, status, dnsrec);
-
-  /* Delay calling the query callback */
-  if (requeue != NULL) {
-    ares_append_endqueue(requeue, query, status, dnsrec);
-    return;
-  }
 
   /* Invoke the callback. */
   query->callback(query->arg, status, query->timeouts, dnsrec);
